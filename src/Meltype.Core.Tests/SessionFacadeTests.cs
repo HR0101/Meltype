@@ -796,6 +796,87 @@ internal static class SessionFacadeTests
         Assert.True(Type(session, "@file").All(r => !r.Consumed), "空白の後の @file はアプリへ");
     }
 
+    private static MeltypeSession SlashSession(SlashStyle style, bool sigilWords = true)
+    {
+        var detector = CompositionDetector.CreateDefault();
+        detector.SpellChecker = Detection.BuiltInWordChecker.Shared;
+        var settings = new Settings { Slash = style, SigilWordsDirect = sigilWords };
+        return new MeltypeSession(detector, new CompositionTests.FakeConverter(),
+            new CompositionOptions { Slash = () => settings.Slash }, () => settings);
+    }
+
+    private static string SlashOutput(MeltypeSession session, string input)
+    {
+        var keys = input + "\n";
+        var results = Type(session, keys);
+        var output = "";
+        for (var i = 0; i < results.Count; i++)
+        {
+            foreach (var edit in results[i].Commits)
+                output = output[..Math.Max(0, output.Length - edit.DeleteBefore)] + edit.Text;
+            if (!results[i].Consumed) output += keys[i];
+        }
+        return output;
+    }
+
+    [Test]
+    public static void ContextualSlash_FollowsTheNextWord()
+    {
+        foreach (var sigil in new[] { true, false })
+            foreach (var (input, expected) in new[] {
+            ("/exit", "/exit"), ("/review", "/review"), ("/command", "/command"),
+            ("/hai", "・はい"), ("/nihongo", "・にほんご"), ("hai/hai", "はい・はい"),
+            ("hai/exit", "はい/exit"), ("exit/hai", "exit/はい"),
+            ("https://example.com", "https://example.com"), ("3/4", "3/4"),
+            ("/home", "/home"), ("/tmp", "/tmp"),
+            ("/home/user", "/home/user"), ("/app.sh", "/app.sh"), ("/.config", "/.config") })
+                Assert.Equal(expected, SlashOutput(SlashSession(SlashStyle.Contextual, sigil), input), $"{input}, SigilWordsDirect={sigil}");
+    }
+
+    [Test]
+    public static void ContextualSlash_IsOptInAndOtherStylesKeepTheirBehavior()
+    {
+        foreach (var (style, expected) in new[] {
+            (SlashStyle.Slash, "はい/はい"), (SlashStyle.MiddleDot, "はい・はい"),
+            (SlashStyle.FullWidth, "はい／はい"), (SlashStyle.Contextual, "はい・はい") })
+            Assert.Equal(expected, SlashOutput(SlashSession(style), "hai/hai"), style.ToString());
+        Assert.Equal("・exit", SlashOutput(SlashSession(SlashStyle.Slash), "/exit"), "既定では自動切り替えにしない");
+        var session = SlashSession(SlashStyle.Contextual);
+        Assert.Equal("・", Type(session, "/")[0].View?.Text, "後ろが未入力なら一旦中黒");
+        Assert.Equal("/exit", Type(session, "exit")[^1].View?.Text, "後ろが英語なら表示も切り替わる");
+    }
+
+    [Test]
+    public static void ContextualSlash_ReevaluatesAfterBackspaceAndPreservesPaths()
+    {
+        var session = SlashSession(SlashStyle.Contextual);
+        Type(session, "/exit");
+        // 削除途中で日本語と判定された部分は、既存の仕様どおり 1 音ずつ消える。
+        string? showing = null;
+        for (var i = 0; i < 4 && showing != "・"; i++) showing = Type(session, "\b")[0].View?.Text;
+        Assert.Equal("・", showing, "後続の語を消したら一旦中黒に戻す");
+        Assert.Equal("・はい", Type(session, "hai")[^1].View?.Text, "後ろを日本語に打ち直せる");
+        foreach (var path in new[] { "/home", "/tmp", "/data", "/home/user", "/app.sh", "/.config" })
+        {
+            session = SlashSession(SlashStyle.Contextual);
+            Type(session, path);
+            Assert.Equal(path, session.CommitPending().Commits.Single().Text, "フォーカスが外れてもパスの原文を保つ");
+        }
+    }
+
+    [Test]
+    public static void ContextualSlash_PreservesDirectAndCodeInput()
+    {
+        var direct = SlashSession(SlashStyle.Contextual);
+        direct.Direct = true;
+        Assert.True(Type(direct, "/hai").All(r => !r.Consumed), "直接入力には触れない");
+        var code = SlashSession(SlashStyle.Contextual);
+        code.CodeInput = true;
+        for (var i = 0; i < "/exit".Length; i++)
+            Assert.True(!Type(code, "/exit"[i].ToString(), before: "> " + "/exit"[..i])[0].Consumed,
+                "コードのコマンドは従来どおりアプリへ渡す");
+    }
+
     [Test]
     public static void SlashAtStart_IsMiddleDotInText()
     {
